@@ -83,12 +83,35 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             for item in input_text:
                 if isinstance(item, dict):
                     role = item.get("role", "user")
+                    itype = item.get("type", "")
                     content = item.get("content", "")
-                    if role == "tool" and item.get("call_id"):
+                    # Responses API: function call result from Codex
+                    if itype == "function_call_output" and item.get("call_id"):
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": item["call_id"],
+                            "content": str(item.get("output", ""))
+                        })
+                    # Legacy / chat-style tool role
+                    elif role == "tool" and item.get("call_id"):
                         messages.append({
                             "role": "tool",
                             "tool_call_id": item["call_id"],
                             "content": str(content)
+                        })
+                    # Responses API: assistant's previous function call
+                    elif itype == "function_call" and item.get("call_id"):
+                        messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": item["call_id"],
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": item.get("arguments", "{}")
+                                }
+                            }]
                         })
                     elif role == "assistant" and item.get("tool_calls"):
                         messages.append({
@@ -150,16 +173,17 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                 }]
 
                 if tool_calls:
-                    tc = []
                     for c in tool_calls:
                         fn = c.get("function", {})
-                        tc.append({
+                        # Each function call is a standalone output item
+                        # (standard Responses API format)
+                        output.append({
                             "type": "function_call",
                             "id": c.get("id", ""),
+                            "call_id": c.get("id", ""),
                             "name": fn.get("name", ""),
                             "arguments": fn.get("arguments", "{}")
                         })
-                    output.append({"type": "function_call", "calls": tc})
 
                 codex_resp = {
                     "id": ds_body.get("id", ""),
@@ -271,6 +295,19 @@ class Proxy(http.server.BaseHTTPRequestHandler):
                         "role": "assistant",
                         "status": "completed",
                         "content": [{"type": "output_text", "text": full_text}]
+                    })
+
+                # Emit accumulated tool calls (previously dropped entirely)
+                for idx in sorted(tool_calls.keys()):
+                    tc = tool_calls[idx]
+                    if not tc.get("name"):
+                        continue
+                    output_items.append({
+                        "type": "function_call",
+                        "id": tc["id"] or f"call_{idx}",
+                        "call_id": tc["id"] or f"call_{idx}",
+                        "name": tc["name"],
+                        "arguments": tc["arguments"] or "{}"
                     })
 
                 complete = json.dumps({
